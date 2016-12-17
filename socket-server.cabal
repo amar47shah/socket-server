@@ -26,6 +26,7 @@ executable socket-server-exe
   build-depends:       base
                      , socket-server
                      , async
+                     , containers
                      , network
                      , stm
   default-language:    Haskell2010
