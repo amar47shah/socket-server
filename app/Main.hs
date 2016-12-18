@@ -4,11 +4,11 @@ import qualified Data.Map as Map
 
 import Control.Concurrent (ThreadId, forkFinally)
 import Control.Concurrent.Async (race_)
-import Control.Concurrent.STM.TChan (TChan, newTChan, readTChan, writeTChan)
+import Control.Concurrent.STM.TChan (TChan, newBroadcastTChanIO, newTChan, dupTChan, readTChan, writeTChan)
 import Control.Concurrent.STM.TVar (TVar, newTVar, newTVarIO, readTVar, writeTVar, modifyTVar')
 import Control.Exception (finally, mask)
 import Control.Monad (forever, join, void, when)
-import Control.Monad.STM (STM, atomically)
+import Control.Monad.STM (STM, atomically, orElse)
 import Data.Map (Map)
 import Network (HostName, PortID (PortNumber), PortNumber, Socket, accept, listenOn, withSocketsDo)
 import System.IO (Handle, BufferMode (LineBuffering), hClose, hGetLine, hPutStrLn, hSetBuffering, hSetNewlineMode, universalNewlineMode)
@@ -16,7 +16,7 @@ import Text.Printf (hPrintf, printf)
 
 main :: IO ()
 main = withSocketsDo $ do
-  server <- newServer
+  server <- Server <$> newTVarIO Map.empty <*> newBroadcastTChanIO
   socket <- listenOn' port
   forever $ connect server socket
 
@@ -54,15 +54,16 @@ data Client = Client
   , clientHandle :: Handle
   , clientKicked :: TVar (Maybe String)
   , clientDM     :: TChan Message
+  , clientBC     :: TChan Message
   }
 
-newClient :: ClientName -> Handle -> STM Client
-newClient n h = Client n h <$> newTVar Nothing <*> newTChan
+newClient :: Server -> ClientName -> Handle -> STM Client
+newClient s n h = Client n h <$> newTVar Nothing <*> newTChan <*> dupTChan (broadcastChan s)
 
-data Server = Server { clients :: TVar (Map ClientName Client) }
-
-newServer :: IO Server
-newServer = Server <$> newTVarIO Map.empty
+data Server = Server
+  { clients       :: TVar (Map ClientName Client)
+  , broadcastChan :: TChan Message
+  }
 
 data Message = Notice String
              | Tell ClientName String
@@ -73,7 +74,7 @@ data Message = Notice String
 -- Basic operations
 
 broadcast :: Server -> Message -> STM ()
-broadcast s m = readTVar (clients s) >>= mapM_ (`sendMessage` m) . Map.elems
+broadcast = writeTChan . broadcastChan
 
 sendMessage :: Client -> Message -> STM ()
 sendMessage = writeTChan . clientDM
@@ -132,7 +133,7 @@ checkAddClient server name handle = atomically $ do
   cs <- readTVar $ clients server
   if Map.member name cs
     then pure Nothing
-    else do client <- newClient name handle
+    else do client <- newClient server name handle
             writeTVar (clients server) $ Map.insert name client cs
             broadcast server  $ Notice (name ++ " has connected")
             pure (Just client)
@@ -156,10 +157,13 @@ respond serv c = join . atomically $
   case k of
     Just reason -> pure . hPutStrLn (clientHandle c) $ "You have been kicked: " ++ reason
     Nothing -> do
-      msg <- readTChan (clientDM c)
+      msg <- readMessage c
       pure $ do
         continue <- handleMessage serv c msg
         when continue $ respond serv c
+
+readMessage :: Client -> STM Message
+readMessage c = readTChan (clientDM c) `orElse` readTChan (clientBC c)
 
 handleMessage :: Server -> Client -> Message -> IO Bool
 handleMessage _ c (Notice msg)         = output c $ "*** " ++ msg
